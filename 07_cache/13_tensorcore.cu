@@ -1,4 +1,6 @@
 #include <iostream>
+#include <typeinfo>
+#include <random>
 #include <stdint.h>
 #include <cublas_v2.h>
 #include <mma.h>
@@ -9,8 +11,15 @@ using namespace nvcuda;
 
 // ============================================================
 //  Optimised Tensor Core GEMM for H100 (TSUBAME4.0)
+//
 //  Compile: nvcc -O3 -arch=sm_90 -lcublas 13_tensorcore.cu -o 13_tensorcore
-//  ~77% of cuBLAS vs ~5% for the starter kernel
+//
+//  Optimisations over starter:
+//  1. Half-precision inputs (pre-converted once)
+//  2. Transposed B for coalesced smem loads
+//  3. 128x128 block tile, BK=32, double-buffered smem
+//  4. 256 threads, vectorised int4 loads
+//  Result: ~32% of cuBLAS vs ~5% for starter
 // ============================================================
 
 #define BM 128
@@ -19,21 +28,30 @@ using namespace nvcuda;
 #define WM 16
 #define WN 16
 #define WK 16
-#define FRAG_M 1
-#define FRAG_N 2
-#define WARPS_M 8
-#define WARPS_N 4
-#define NUM_WARPS (WARPS_M * WARPS_N)
-#define BLOCK_DIM (NUM_WARPS * 32)
+#define FRAG_M 2
+#define FRAG_N 4
+#define WARPS_M 4
+#define WARPS_N 2
+#define NUM_WARPS (WARPS_M * WARPS_N)  // 8
+#define BLOCK_DIM (NUM_WARPS * 32)     // 256
 #define PAD 8
 #define STAGES 2
 
-// Simple scalar conversion — no vectorisation, definitely correct
 __global__ void cvt_f2h(const float* __restrict__ src,
                                half*  __restrict__ dst, int N)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) dst[i] = __float2half(src[i]);
+    int i8 = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i8 + 7 < N) {
+        float4 a = reinterpret_cast<const float4*>(src)[i8/4];
+        float4 b = reinterpret_cast<const float4*>(src)[i8/4+1];
+        dst[i8+0]=__float2half(a.x); dst[i8+1]=__float2half(a.y);
+        dst[i8+2]=__float2half(a.z); dst[i8+3]=__float2half(a.w);
+        dst[i8+4]=__float2half(b.x); dst[i8+5]=__float2half(b.y);
+        dst[i8+6]=__float2half(b.z); dst[i8+7]=__float2half(b.w);
+    } else {
+        for (int j = 0; j < 8 && i8+j < N; j++)
+            dst[i8+j] = __float2half(src[i8+j]);
+    }
 }
 
 __global__ void transpose_b(const half* __restrict__ src,
@@ -51,7 +69,7 @@ __global__ void transpose_b(const half* __restrict__ src,
         dst[n + k*dim_n] = tile[threadIdx.x][threadIdx.y];
 }
 
-__global__ void __launch_bounds__(BLOCK_DIM, 1)
+__global__ void __launch_bounds__(BLOCK_DIM, 2)
 kernel(int dim_m, int dim_n, int dim_k,
        const half* __restrict__ d_a,
        const half* __restrict__ d_bt,
@@ -74,8 +92,8 @@ kernel(int dim_m, int dim_n, int dim_k,
         for (int j = 0; j < FRAG_N; j++)
             wmma::fill_fragment(acc[i][j], 0.0f);
 
-    const int A_ITERS = (BK*BM) / (BLOCK_DIM*8);
-    const int B_ITERS = (BK*BN) / (BLOCK_DIM*8);
+    const int A_ITERS = (BK*BM) / (BLOCK_DIM*8);  // 2
+    const int B_ITERS = (BK*BN) / (BLOCK_DIM*8);  // 2
 
     auto load_smem = [&](int s, int kt) {
         int kb = kt * BK;
@@ -88,11 +106,12 @@ kernel(int dim_m, int dim_n, int dim_k,
             if (gm+7 < dim_m && gk < dim_k)
                 *reinterpret_cast<int4*>(&smem_a[s][kk][mm]) =
                     *reinterpret_cast<const int4*>(&d_a[gm + gk*dim_m]);
-            else
+            else {
                 #pragma unroll
                 for (int x = 0; x < 8; x++)
                     smem_a[s][kk][mm+x] = (gm+x < dim_m && gk < dim_k)
                         ? __ldg(&d_a[gm+x + gk*dim_m]) : __float2half(0.f);
+            }
         }
         #pragma unroll
         for (int iter = 0; iter < B_ITERS; iter++) {
@@ -103,11 +122,12 @@ kernel(int dim_m, int dim_n, int dim_k,
             if (gn+7 < dim_n && gk < dim_k)
                 *reinterpret_cast<int4*>(&smem_b[s][kk][nn]) =
                     *reinterpret_cast<const int4*>(&d_bt[gn + gk*dim_n]);
-            else
+            else {
                 #pragma unroll
                 for (int x = 0; x < 8; x++)
                     smem_b[s][kk][nn+x] = (gn+x < dim_n && gk < dim_k)
                         ? __ldg(&d_bt[gn+x + gk*dim_n]) : __float2half(0.f);
+            }
         }
     };
 
@@ -153,95 +173,111 @@ kernel(int dim_m, int dim_n, int dim_k,
         }
 }
 
-int main()
+// ── Device buffers allocated once ─────────────────────────────
+static half *dhA = nullptr, *dhBT = nullptr;
+
+int main(int argc, const char **argv)
 {
-    int m = 10240, k = 4096, n = 8192;
-    float alpha = 1.0f, beta = 0.0f;
+    int m = 10240;
+    int k = 4096;
+    int n = 8192;
+    float alpha = 1.0;
+    float beta = 0.0;
     int Nt = 10;
 
-    size_t szA=(size_t)m*k*sizeof(float);
-    size_t szB=(size_t)k*n*sizeof(float);
-    size_t szC=(size_t)m*n*sizeof(float);
+    float *A, *B, *C, *C2;
+    cudaMallocManaged(&A, m * k * sizeof(float));
+    cudaMallocManaged(&B, k * n * sizeof(float));
+    cudaMallocManaged(&C, m * n * sizeof(float));
+    cudaMallocManaged(&C2, m * n * sizeof(float));
 
-    float *hA=(float*)malloc(szA), *hB=(float*)malloc(szB);
-    float *hC=(float*)malloc(szC), *hC2=(float*)malloc(szC);
-    for (int i=0;i<m;i++) for (int j=0;j<k;j++) hA[k*i+j]=drand48();
-    for (int i=0;i<k;i++) for (int j=0;j<n;j++) hB[n*i+j]=drand48();
-    memset(hC,0,szC); memset(hC2,0,szC);
+    for (int i=0; i<m; i++)
+        for (int j=0; j<k; j++)
+            A[k*i+j] = drand48();
+    for (int i=0; i<k; i++)
+        for (int j=0; j<n; j++)
+            B[n*i+j] = drand48();
+    for (int i=0; i<n; i++)
+        for (int j=0; j<m; j++)
+            C[m*i+j] = C2[m*i+j] = 0;
 
-    float *dA,*dB,*dC,*dC2;
-    cudaMalloc(&dA,szA); cudaMalloc(&dB,szB);
-    cudaMalloc(&dC,szC); cudaMalloc(&dC2,szC);
-    cudaMemcpy(dA,hA,szA,cudaMemcpyHostToDevice);
-    cudaMemcpy(dB,hB,szB,cudaMemcpyHostToDevice);
-    cudaMemset(dC,0,szC); cudaMemset(dC2,0,szC);
-
-    cublasHandle_t handle;
-    cublasCreate(&handle);
-
-    cublasGemmEx(handle,CUBLAS_OP_N,CUBLAS_OP_N,m,n,k,&alpha,
-                 dA,CUDA_R_32F,m,dB,CUDA_R_32F,k,&beta,
-                 dC,CUDA_R_32F,m,CUBLAS_COMPUTE_32F_FAST_16F,
-                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    cudaDeviceSynchronize();
-    auto tic=chrono::steady_clock::now();
-    for (int i=0;i<Nt;i++){
-        cublasGemmEx(handle,CUBLAS_OP_N,CUBLAS_OP_N,m,n,k,&alpha,
-                     dA,CUDA_R_32F,m,dB,CUDA_R_32F,k,&beta,
-                     dC,CUDA_R_32F,m,CUBLAS_COMPUTE_32F_FAST_16F,
+    // ── cuBLAS reference ──────────────────────────────────────
+    cublasHandle_t cublas_handle;
+    cublasCreate(&cublas_handle);
+    auto tic = chrono::steady_clock::now();
+    for (int i = 0; i < Nt+2; i++) {
+        if (i == 2) tic = chrono::steady_clock::now();
+        cublasGemmEx(cublas_handle,
+                     CUBLAS_OP_N, CUBLAS_OP_N,
+                     m, n, k, &alpha,
+                     A, CUDA_R_32F, m,
+                     B, CUDA_R_32F, k,
+                     &beta,
+                     C, CUDA_R_32F, m,
+                     CUBLAS_COMPUTE_32F_FAST_16F,
                      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         cudaDeviceSynchronize();
     }
-    auto toc=chrono::steady_clock::now();
-    int64_t num_flops=2LL*m*n*k+2LL*m*n;
-    double tcublas=chrono::duration<double>(toc-tic).count()/Nt;
-    double cublas_flops=num_flops/tcublas/1e9;
+    auto toc = chrono::steady_clock::now();
+    int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
+    double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
+    double cublas_flops = double(num_flops) / tcublas / 1.0e9;
 
-    // Prepare half-precision inputs
-    half *dhA,*dhBT,*dhB_tmp;
-    cudaMalloc(&dhA,   (size_t)m*k*sizeof(half));
-    cudaMalloc(&dhB_tmp,(size_t)k*n*sizeof(half));
-    cudaMalloc(&dhBT,  (size_t)n*k*sizeof(half));
-    int T=256;
-    cvt_f2h<<<((size_t)m*k+T-1)/T,T>>>(dA,dhA,m*k);
-    cvt_f2h<<<((size_t)k*n+T-1)/T,T>>>(dB,dhB_tmp,k*n);
-    transpose_b<<<dim3((k+31)/32,(n+31)/32),dim3(32,32)>>>(dhB_tmp,dhBT,k,n);
+    // ── Prepare half-precision inputs (once) ──────────────────
+    // A and B are in managed memory — copy to device-only half buffers
+    float *dA_dev, *dB_dev;
+    cudaMalloc(&dA_dev, (size_t)m*k*sizeof(float));
+    cudaMalloc(&dB_dev, (size_t)k*n*sizeof(float));
+    cudaMemcpy(dA_dev, A, (size_t)m*k*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB_dev, B, (size_t)k*n*sizeof(float), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&dhA, (size_t)m*k*sizeof(half));
+    half *dhB_tmp;
+    cudaMalloc(&dhB_tmp, (size_t)k*n*sizeof(half));
+    cudaMalloc(&dhBT, (size_t)n*k*sizeof(half));
+
+    int T = 256;
+    cvt_f2h<<<((size_t)m*k/8+T-1)/T, T>>>(dA_dev, dhA, m*k);
+    cvt_f2h<<<((size_t)k*n/8+T-1)/T, T>>>(dB_dev, dhB_tmp, k*n);
+    transpose_b<<<dim3((k+31)/32,(n+31)/32),dim3(32,32)>>>(dhB_tmp, dhBT, k, n);
     cudaFree(dhB_tmp);
+    cudaFree(dA_dev);
+    cudaFree(dB_dev);
+
+    // C2 is managed — get a device pointer for it
+    float *dC2_dev;
+    cudaMalloc(&dC2_dev, (size_t)m*n*sizeof(float));
+    cudaMemset(dC2_dev, 0, (size_t)m*n*sizeof(float));
     cudaDeviceSynchronize();
 
+    // ── Our kernel ────────────────────────────────────────────
     dim3 block(BLOCK_DIM);
-    dim3 grid((m+BM-1)/BM,(n+BN-1)/BN);
-    kernel<<<grid,block>>>(m,n,k,dhA,dhBT,dC2);
-    cudaDeviceSynchronize();
-    tic=chrono::steady_clock::now();
-    for (int i=0;i<Nt;i++){
-        kernel<<<grid,block>>>(m,n,k,dhA,dhBT,dC2);
+    dim3 grid((m+BM-1)/BM, (n+BN-1)/BN);
+
+    for (int i = 0; i < Nt+2; i++) {
+        if (i == 2) tic = chrono::steady_clock::now();
+        kernel<<<grid, block>>>(m, n, k, dhA, dhBT, dC2_dev);
         cudaDeviceSynchronize();
     }
-    toc=chrono::steady_clock::now();
-    double tkernel=chrono::duration<double>(toc-tic).count()/Nt;
-    double kernel_flops=num_flops/tkernel/1e9;
+    toc = chrono::steady_clock::now();
 
-    printf("CUBLAS: %.2f Gflops, KERNEL: %.2f Gflops\n",cublas_flops,kernel_flops);
+    // Copy result back for error check
+    cudaMemcpy(C2, dC2_dev, (size_t)m*n*sizeof(float), cudaMemcpyDeviceToHost);
 
-    cudaMemcpy(hC, dC, szC,cudaMemcpyDeviceToHost);
-    cudaMemcpy(hC2,dC2,szC,cudaMemcpyDeviceToHost);
+    double tcutlass = chrono::duration<double>(toc - tic).count() / Nt;
+    double cutlass_flops = double(num_flops) / tcutlass / 1.0e9;
 
-    double err=0;
-    int nan_count=0;
-    for (int i=0;i<n;i++){
-        for (int j=0;j<m;j++){
-            float v1=hC[m*i+j], v2=hC2[m*i+j];
-            if (isnan(v1)||isnan(v2)) nan_count++;
-            else err+=fabs(v1-v2);
-        }
-    }
-    if (nan_count>0) printf("NaN count: %d\n", nan_count);
+    printf("CUBLAS: %.2f Gflops, CUTLASS: %.2f Gflops\n", cublas_flops, cutlass_flops);
+
+    double err = 0;
+    for (int i=0; i<n; i++)
+        for (int j=0; j<m; j++)
+            err += fabs(C[m*i+j] - C2[m*i+j]);
     printf("error: %lf\n", err/n/m);
 
-    cudaFree(dA);cudaFree(dB);cudaFree(dC);cudaFree(dC2);
-    cudaFree(dhA);cudaFree(dhBT);
-    free(hA);free(hB);free(hC);free(hC2);
-    cublasDestroy(handle);
+    cudaFree(A); cudaFree(B); cudaFree(C); cudaFree(C2);
+    cudaFree(dC2_dev);
+    cudaFree(dhA); cudaFree(dhBT);
+    cublasDestroy(cublas_handle);
     return 0;
 }
